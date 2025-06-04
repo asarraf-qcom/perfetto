@@ -94,6 +94,9 @@ class FtraceParser {
   void ParseSdeTracingMarkWrite(int64_t timestamp,
                                 uint32_t pid,
                                 protozero::ConstBytes);
+  void ParseMsmCvpTracingMarkWrite(int64_t timestamp,
+                                   uint32_t pid,
+                                   protozero::ConstBytes);
   void ParseDpuTracingMarkWrite(int64_t timestamp,
                                 uint32_t pid,
                                 protozero::ConstBytes);

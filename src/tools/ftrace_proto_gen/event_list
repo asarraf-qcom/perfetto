@@ -544,3 +544,4 @@ block/block_io_done
 mali/gpu_power_state
 dpu/disp_dpu_underrun
 dpu/disp_vblank_irq_enable
+msm_cvp/tracing_mark_write
