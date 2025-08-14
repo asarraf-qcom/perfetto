@@ -86,6 +86,9 @@ namespace perfetto::trace_processor::stats {
        "enable. See ftrace_setup_errors in the metadata table for details."),  \
   F(ftrace_abi_errors_skipped_zero_data_length,                                \
                                           kSingle,  kInfo,     kAnalysis, ""), \
+  F(ftrace_generic_descriptor_errors,     kSingle,  kError,    kAnalysis,      \
+       "The config is setting denser_generic_event_encoding, but there are "   \
+       "issues with parsing or matching up the in-trace proto descriptors."),  \
   F(ftrace_thermal_exynos_acpm_unknown_tz_id,                                  \
                                           kSingle,  kError,    kAnalysis, ""), \
   F(fuchsia_non_numeric_counters,         kSingle,  kError,    kAnalysis, ""), \
@@ -122,6 +125,9 @@ namespace perfetto::trace_processor::stats {
        "Implausibly large increment to value received from "                   \
        "SuspendControlService. Indicates a transient error in "                \
        "SuspendControlService."),                                              \
+  F(kernel_trackevent_format_error,       kSingle,  kError,    kAnalysis,      \
+       "Ftrace event payloads did not match the format file while being "      \
+       "parsed as kernel track events."),                                      \
   F(app_wakelock_parse_error,             kSingle,  kError,    kAnalysis,      \
        "Parsing packed repeated field. Should never happen."),                 \
   F(app_wakelock_unknown_id,              kSingle,  kError,    kAnalysis,      \

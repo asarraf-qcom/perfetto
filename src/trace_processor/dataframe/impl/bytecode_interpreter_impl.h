@@ -30,8 +30,8 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
-#include <vector>
 
+#include "perfetto/base/compiler.h"
 #include "perfetto/base/logging.h"
 #include "perfetto/ext/base/endian.h"
 #include "perfetto/ext/base/flat_hash_map.h"
@@ -47,6 +47,7 @@
 #include "src/trace_processor/dataframe/impl/bytecode_registers.h"
 #include "src/trace_processor/dataframe/impl/flex_vector.h"
 #include "src/trace_processor/dataframe/impl/slab.h"
+#include "src/trace_processor/dataframe/impl/sort.h"
 #include "src/trace_processor/dataframe/impl/types.h"
 #include "src/trace_processor/dataframe/specs.h"
 #include "src/trace_processor/dataframe/types.h"
@@ -129,7 +130,8 @@ template <typename T>
 PERFETTO_ALWAYS_INLINE bool HandleInvalidCastFilterValueResult(
     const CastFilterValueResult::Validity& validity,
     T& update) {
-  static_assert(std::is_same_v<T, Range> || std::is_same_v<T, Span<uint32_t>>);
+  static_assert(std::is_same_v<T, Range> || std::is_same_v<T, Span<uint32_t>> ||
+                std::is_same_v<T, Span<const uint32_t>>);
   if (PERFETTO_UNLIKELY(validity != CastFilterValueResult::kValid)) {
     if (validity == CastFilterValueResult::kNoneMatch) {
       update.e = update.b;
@@ -432,6 +434,12 @@ class InterpreterImpl {
     return true;
   }
 
+  PERFETTO_ALWAYS_INLINE void Reverse(const bytecode::Reverse& r) {
+    using B = bytecode::Reverse;
+    auto& update = ReadFromRegister(r.arg<B::update_register>());
+    std::reverse(update.b, update.e);
+  }
+
   template <typename T, typename RangeOp>
   PERFETTO_ALWAYS_INLINE void SortedFilter(
       const bytecode::SortedFilterBase& f) {
@@ -580,9 +588,37 @@ class InterpreterImpl {
     update.e = static_cast<uint32_t>(it - storage);
   }
 
-  PERFETTO_ALWAYS_INLINE void SpecializedStorageSmallValueEq(
-      const bytecode::SpecializedStorageSmallValueEq& bytecode) {
-    using B = bytecode::SpecializedStorageSmallValueEq;
+  PERFETTO_ALWAYS_INLINE void SmallValueEqSortedNoDup(
+      const bytecode::SmallValueEqSortedNoDup& bytecode) {
+    using B = bytecode::SmallValueEqSortedNoDup;
+
+    const CastFilterValueResult& cast_result =
+        ReadFromRegister(bytecode.arg<B::val_register>());
+    auto& update = ReadFromRegister(bytecode.arg<B::update_register>());
+    if (!HandleInvalidCastFilterValueResult(cast_result.validity, update)) {
+      return;
+    }
+    using ValueType =
+        StorageType::VariantTypeAtIndex<Uint32, CastFilterValueResult::Value>;
+    auto val = base::unchecked_get<ValueType>(cast_result.value);
+    const auto& col = GetColumn(bytecode.arg<B::col>());
+    const auto& storage = col.specialized_storage.template unchecked_get<
+        SpecializedStorage::SmallValueEqSortedNoDup>();
+
+    uint32_t k =
+        val < storage.bit_vector.size() && storage.bit_vector.is_set(val)
+            ? static_cast<uint32_t>(
+                  storage.prefix_popcount[val / 64] +
+                  storage.bit_vector.count_set_bits_until_in_word(val))
+            : update.e;
+    bool in_bounds = update.b <= k && k < update.e;
+    update.b = in_bounds ? k : update.e;
+    update.e = in_bounds ? k + 1 : update.b;
+  }
+
+  PERFETTO_ALWAYS_INLINE void SmallValueEqNoDup(
+      const bytecode::SmallValueEqNoDup& bytecode) {
+    using B = bytecode::SmallValueEqNoDup;
 
     const CastFilterValueResult& cast_result =
         ReadFromRegister(bytecode.arg<B::val_register>());
@@ -596,17 +632,55 @@ class InterpreterImpl {
     const auto& col = GetColumn(bytecode.arg<B::col>());
     const auto& storage =
         col.specialized_storage
+            .template unchecked_get<SpecializedStorage::SmallValueEqNoDup>();
+
+    // If `val` is outside the bounds of the `value_to_index` map, or if the
+    // value is not present in the column (indicated by the sentinel
+    // `0xffffffff`), `k` is set to `0xffffffff`. This value will always fail
+    // the `k < update.e` check, correctly resulting in an empty range.
+    uint32_t k = val < storage.value_to_index.size()
+                     ? storage.value_to_index[val]
+                     : 0xffffffff;
+
+    bool match_in_bounds = update.b <= k && k < update.e;
+    update.b = match_in_bounds ? k : update.e;
+    update.e = match_in_bounds ? k + 1 : update.b;
+  }
+
+  PERFETTO_ALWAYS_INLINE void SmallValueEq(
+      const bytecode::SmallValueEq& bytecode) {
+    using B = bytecode::SmallValueEq;
+
+    const auto& col = GetColumn(bytecode.arg<B::col>());
+    const auto& storage =
+        col.specialized_storage
             .template unchecked_get<SpecializedStorage::SmallValueEq>();
 
-    uint32_t k =
-        val < storage.bit_vector.size() && storage.bit_vector.is_set(val)
-            ? static_cast<uint32_t>(
-                  storage.prefix_popcount[val / 64] +
-                  storage.bit_vector.count_set_bits_until_in_word(val))
-            : update.e;
-    bool in_bounds = update.b <= k && k < update.e;
-    update.b = in_bounds ? k : update.e;
-    update.e = in_bounds ? k + 1 : update.b;
+    const uint32_t* start_ptr = storage.indices.data();
+    const uint32_t* end_ptr = storage.indices.data();
+
+    // Impossible to have all match for equality.
+    const CastFilterValueResult& cast_result =
+        ReadFromRegister(bytecode.arg<B::val_register>());
+    PERFETTO_DCHECK(cast_result.validity != CastFilterValueResult::kAllMatch);
+    if (PERFETTO_UNLIKELY(cast_result.validity ==
+                          CastFilterValueResult::kNoneMatch)) {
+      WriteToRegister(bytecode.arg<B::write_register>(),
+                      Span<const uint32_t>{start_ptr, end_ptr});
+      return;
+    }
+
+    using ValueType =
+        StorageType::VariantTypeAtIndex<Uint32, CastFilterValueResult::Value>;
+    auto val = base::unchecked_get<ValueType>(cast_result.value);
+    if (PERFETTO_LIKELY(val + 1 < storage.value_to_indices_start.size())) {
+      uint32_t start_idx = storage.value_to_indices_start[val];
+      uint32_t end_idx = storage.value_to_indices_start[val + 1];
+      start_ptr = storage.indices.data() + start_idx;
+      end_ptr = storage.indices.data() + end_idx;
+    }
+    WriteToRegister(bytecode.arg<B::write_register>(),
+                    Span<const uint32_t>{start_ptr, end_ptr});
   }
 
   template <typename T, typename Op>
@@ -923,10 +997,11 @@ class InterpreterImpl {
       const bytecode::IndexPermutationVectorToSpan& bytecode) {
     using B = bytecode::IndexPermutationVectorToSpan;
     const dataframe::Index& index = state_.indexes[bytecode.arg<B::index>()];
-    WriteToRegister(bytecode.arg<B::write_register>(),
-                    Span<uint32_t>(index.permutation_vector()->data(),
-                                   index.permutation_vector()->data() +
-                                       index.permutation_vector()->size()));
+    WriteToRegister(
+        bytecode.arg<B::write_register>(),
+        Span<const uint32_t>(index.permutation_vector()->data(),
+                             index.permutation_vector()->data() +
+                                 index.permutation_vector()->size()));
   }
 
   template <typename T, typename N>
@@ -1030,18 +1105,29 @@ class InterpreterImpl {
     PERFETTO_DCHECK(rank_map_ptr && rank_map_ptr.get());
     auto& rank_map = *rank_map_ptr;
 
-    std::vector<StringPool::Id> ids_to_sort;
-    ids_to_sort.reserve(rank_map.size());
+    struct SortToken {
+      std::string_view str_view;
+      StringPool::Id id;
+      PERFETTO_ALWAYS_INLINE bool operator<(const SortToken& other) const {
+        return str_view < other.str_view;
+      }
+    };
+    // Initally do *not* default initialize the array for performance.
+    std::unique_ptr<SortToken[]> ids_to_sort(new SortToken[rank_map.size()]);
+    std::unique_ptr<SortToken[]> scratch(new SortToken[rank_map.size()]);
+    uint32_t i = 0;
     for (auto it = rank_map.GetIterator(); it; ++it) {
-      ids_to_sort.push_back(it.key());
+      base::StringView str_view = state_.string_pool->Get(it.key());
+      ids_to_sort[i++] = SortToken{
+          std::string_view(str_view.data(), str_view.size()),
+          it.key(),
+      };
     }
-    std::sort(ids_to_sort.begin(), ids_to_sort.end(),
-              [this](StringPool::Id a, StringPool::Id b) {
-                return state_.string_pool->Get(a) < state_.string_pool->Get(b);
-              });
-
-    for (uint32_t rank = 0; rank < ids_to_sort.size(); ++rank) {
-      auto* it = rank_map.Find(ids_to_sort[rank]);
+    auto* sorted = base::MsdRadixSort(
+        ids_to_sort.get(), ids_to_sort.get() + rank_map.size(), scratch.get(),
+        [](const SortToken& token) { return token.str_view; });
+    for (uint32_t rank = 0; rank < rank_map.size(); ++rank) {
+      auto* it = rank_map.Find(sorted[rank].id);
       PERFETTO_DCHECK(it);
       *it = rank;
     }
@@ -1051,34 +1137,59 @@ class InterpreterImpl {
       const bytecode::SortRowLayout& bytecode) {
     using B = bytecode::SortRowLayout;
 
+    auto& indices = ReadFromRegister(bytecode.arg<B::indices_register>());
+    auto num_indices = static_cast<size_t>(indices.e - indices.b);
+
+    // Single element is always sorted.
+    if (num_indices <= 1) {
+      return;
+    }
+
     const auto& buffer_slab =
         ReadFromRegister(bytecode.arg<B::buffer_register>());
     const uint8_t* buf = buffer_slab.data();
 
-    auto& indices = ReadFromRegister(bytecode.arg<B::indices_register>());
-    auto num_indices = static_cast<size_t>(indices.e - indices.b);
     uint32_t stride = bytecode.arg<B::total_row_stride>();
 
     struct SortToken {
       uint32_t index;
       uint32_t buf_offset;
     };
-    std::vector<SortToken> p;
-    p.reserve(num_indices);
+
+    // Initally do *not* default initialize the array for performance.
+    std::unique_ptr<SortToken[]> p(new SortToken[num_indices]);
+    std::unique_ptr<SortToken[]> q;
     for (uint32_t i = 0; i < num_indices; ++i) {
-      p.push_back({indices.b[i], i * stride});
+      p[i] = {indices.b[i], i * stride};
     }
-    // TODO(lalitm): this does *not* need to be a stable sort but we're using it
-    // right now to avoid breaking people who are implicitly relying on the
-    // stability. Once dataframe has landed and been stable for a while, we
-    // should switch away from stable_sort as std::sort is much faster and if we
-    // use a specialized algorithm like radix sort, it can be even faster still.
-    std::stable_sort(
-        p.begin(), p.end(), [buf, stride](SortToken a, SortToken b) {
-          return memcmp(buf + a.buf_offset, buf + b.buf_offset, stride) < 0;
-        });
+
+    // Crossover point where our custom RadixSort starts becoming faster that
+    // std::stable_sort.
+    //
+    // Empirically chosen by looking at the crossover point of benchmarks
+    // BM_DataframeSortLsdRadix and BM_DataframeSortLsdStd.
+    static constexpr uint32_t kStableSortCutoff = 4096;
+    SortToken* res;
+    if (num_indices < kStableSortCutoff) {
+      std::stable_sort(p.get(), p.get() + num_indices,
+                       [buf, stride](const SortToken& a, const SortToken& b) {
+                         return memcmp(buf + a.buf_offset, buf + b.buf_offset,
+                                       stride) < 0;
+                       });
+      res = p.get();
+    } else {
+      // We declare q above and populate it here because res might point to q
+      // so we need to make sure that q outlives the end of this block.
+      // Initally do *not* default initialize the arrays for performance.
+      q.reset(new SortToken[num_indices]);
+      std::unique_ptr<uint32_t[]> counts(new uint32_t[1 << 16]);
+      res = base::RadixSort(
+          p.get(), p.get() + num_indices, q.get(), counts.get(), stride,
+          [buf](const SortToken& token) { return buf + token.buf_offset; });
+    }
+
     for (uint32_t i = 0; i < num_indices; ++i) {
-      indices.b[i] = p[i].index;
+      indices.b[i] = res[i].index;
     }
   }
 
